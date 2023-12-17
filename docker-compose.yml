@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  broker:
+    image: eclipse-mosquitto:2.0@sha256:eca7dcecf2498396b5217bc06ffcc2da889d3a8f65fc0761fc5c4c071b3c272a
+    ports:
+      - ${HOST_MQTT_PORT:-1883}:1883
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    user: "1000:1000"
