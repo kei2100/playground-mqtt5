@@ -4,24 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/eclipse/paho.golang/autopaho/extensions/rpc"
 	"net/url"
 	"sync"
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho"
-	"github.com/eclipse/paho.golang/autopaho/extensions/rpc"
 	"github.com/eclipse/paho.golang/paho"
 )
 
 type Client struct {
-	brokerURL   *url.URL
-	config      *paho.ClientConfig
-	shutdownCtx context.Context
-	shutdown    context.CancelFunc
+	brokerURL             *url.URL
+	config                *paho.ClientConfig
+	requestHandlerManager *requestHandlerManager
+	shutdownCtx           context.Context
+	shutdown              context.CancelFunc
 
-	connMgr    *autopaho.ConnectionManager
-	reqHandler *rpc.Handler
-	mu         sync.Mutex
+	connMgr   *autopaho.ConnectionManager
+	connMgrMu sync.Mutex
 }
 
 func NewClient(brokerURL *url.URL) *Client {
@@ -31,14 +31,15 @@ func NewClient(brokerURL *url.URL) *Client {
 		config: &paho.ClientConfig{
 			Router: paho.NewStandardRouter(),
 		},
-		shutdownCtx: shutdownCtx,
-		shutdown:    shutdown,
+		requestHandlerManager: newRequestHandlerManager(),
+		shutdownCtx:           shutdownCtx,
+		shutdown:              shutdown,
 	}
 }
 
 func (c *Client) Connect(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.connMgrMu.Lock()
+	defer c.connMgrMu.Unlock()
 	if c.connMgr != nil {
 		return errors.New("mqtt5: already connected")
 	}
@@ -48,11 +49,34 @@ func (c *Client) Connect(ctx context.Context) error {
 		KeepAlive:         30,
 		ConnectRetryDelay: time.Second,
 		ConnectTimeout:    time.Second,
-		OnConnectionUp: func(*autopaho.ConnectionManager, *paho.Connack) {
+		OnConnectionUp: func(connMgr *autopaho.ConnectionManager, _ *paho.Connack) {
 			fmt.Println("mqtt5: connected")
+			var delay time.Duration
+			for {
+				select {
+				case <-c.shutdownCtx.Done():
+					return
+				case <-time.After(delay):
+					rh, err := rpc.NewHandler(c.shutdownCtx, rpc.HandlerOpts{
+						Conn:             connMgr,
+						Router:           c.config.Router,
+						ResponseTopicFmt: "%s/responses", // %s には ClientID がセットされる
+						ClientID:         c.config.ClientID,
+					})
+					if err != nil {
+						fmt.Printf("mqtt5: register request handler: %+v", err)
+						delay = time.Second
+						continue
+					}
+					c.requestHandlerManager.SetRequestHandler(rh)
+					fmt.Println("mqtt5: registered request handler")
+					return
+				}
+			}
 		},
 		OnConnectError: func(err error) {
 			fmt.Printf("mqtt5: disconnected: %+v\n", err)
+			c.requestHandlerManager.ResetRequestHandler()
 		},
 		ClientConfig: *c.config,
 	}
@@ -68,44 +92,25 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 func (c *Client) Disconnect(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.connMgrMu.Lock()
+	defer c.connMgrMu.Unlock()
 
 	if c.connMgr == nil {
-		return errors.New("mqtt5: already connected")
+		return errors.New("mqtt5: already disconnected")
 	}
 	if err := c.connMgr.Disconnect(ctx); err != nil {
 		return fmt.Errorf("mqtt5: disconnect: %w", err)
 	}
 	c.connMgr = nil
-	c.reqHandler = nil
 	return nil
 }
 
-// TODO refine
 func (c *Client) Request(ctx context.Context, topic string, payload []byte) ([]byte, error) {
-	var reqHandler *rpc.Handler
-	var err error
-	func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.reqHandler == nil {
-			c.reqHandler, err = rpc.NewHandler(ctx, rpc.HandlerOpts{
-				Conn:             c.connMgr,
-				Router:           c.config.Router,
-				ResponseTopicFmt: "%s/responses",
-				ClientID:         c.config.ClientID,
-			})
-			if err != nil {
-				err = fmt.Errorf("mqtt5: new request handler: %w", err)
-			}
-		}
-		reqHandler = c.reqHandler
-	}()
+	rh, err := c.requestHandlerManager.AwaitRequestHandler(ctx)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := reqHandler.Request(ctx, &paho.Publish{
+	resp, err := rh.Request(ctx, &paho.Publish{
 		Topic:   topic,
 		Payload: payload,
 	})
@@ -124,9 +129,9 @@ func (c *Client) RegisterRequestHandler(topic string, handler func(req []byte) (
 		resp := handler(m.Payload)
 
 		var connMgr *autopaho.ConnectionManager
-		c.mu.Lock()
+		c.connMgrMu.Lock()
 		connMgr = c.connMgr
-		c.mu.Unlock()
+		c.connMgrMu.Unlock()
 
 		if _, err := connMgr.Publish(context.TODO(), &paho.Publish{
 			Properties: &paho.PublishProperties{
@@ -141,11 +146,12 @@ func (c *Client) RegisterRequestHandler(topic string, handler func(req []byte) (
 	})
 }
 
+// TODO refine
 func (c *Client) Subscribe(ctx context.Context, topic string) error {
 	var connMgr *autopaho.ConnectionManager
-	c.mu.Lock()
+	c.connMgrMu.Lock()
 	connMgr = c.connMgr
-	c.mu.Unlock()
+	c.connMgrMu.Unlock()
 
 	if _, err := connMgr.Subscribe(ctx, &paho.Subscribe{
 		Subscriptions: []paho.SubscribeOptions{

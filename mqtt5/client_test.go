@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 	"testing"
+	"time"
 )
 
 var brokerURL, _ = url.Parse("mqtt://127.0.0.1:1883")
@@ -54,11 +55,14 @@ func TestClient_Request(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := cli1.Request(ctx, "foo", []byte("hello"))
-	if err != nil {
-		t.Fatal(err)
+	for {
+		resp, err := cli1.Request(ctx, "foo", []byte("hello"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println(string(resp))
+		time.Sleep(time.Second)
 	}
-	fmt.Println(string(resp))
 }
 
 func signalContext(t *testing.T, ctx context.Context) context.Context {
