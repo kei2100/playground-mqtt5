@@ -2,106 +2,85 @@ package mqtt5
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"github.com/eclipse/paho.golang/autopaho/extensions/rpc"
 	"net/url"
-	"sync"
 	"time"
+
+	"github.com/eclipse/paho.golang/autopaho/extensions/rpc"
 
 	"github.com/eclipse/paho.golang/autopaho"
 	"github.com/eclipse/paho.golang/paho"
 )
 
 type Client struct {
-	brokerURL             *url.URL
 	config                *paho.ClientConfig
+	connectionManager     *connectionManager
 	requestHandlerManager *requestHandlerManager
+	subscriptionManager   *subscriptionManager
 	shutdownCtx           context.Context
 	shutdown              context.CancelFunc
-
-	connMgr   *autopaho.ConnectionManager
-	connMgrMu sync.Mutex
 }
 
 func NewClient(brokerURL *url.URL) *Client {
 	shutdownCtx, shutdown := context.WithCancel(context.Background())
-	return &Client{
-		brokerURL: brokerURL,
-		config: &paho.ClientConfig{
-			Router: paho.NewStandardRouter(),
+	rhManager := newRequestHandlerManager()
+	subMgr := newSubscriptionManager()
+	config := &paho.ClientConfig{
+		Router: paho.NewStandardRouter(),
+	}
+	autoConfig := &autopaho.ClientConfig{
+		BrokerUrls:        []*url.URL{brokerURL},
+		KeepAlive:         30,
+		ConnectRetryDelay: time.Second,
+		ConnectTimeout:    time.Second,
+		OnConnectionUp: func(connMgr *autopaho.ConnectionManager, _ *paho.Connack) {
+			fmt.Println("mqtt5: connected")
+			fmt.Println("mqtt5: setup request handler")
+			rh, err := awaitNewRequestHandler(shutdownCtx, connMgr, config)
+			if err != nil {
+				fmt.Printf("mqtt5: new request handler: %+v", err)
+				return
+			}
+			rhManager.SetRequestHandler(rh)
+			fmt.Println("mqtt5: setup subscriptions")
+			if err := subMgr.ReSubscribe(shutdownCtx, connMgr); err != nil {
+				fmt.Printf("mqtt5: re-subscribe: %+v", err)
+				return
+			}
 		},
-		requestHandlerManager: newRequestHandlerManager(),
+		OnConnectError: func(err error) {
+			fmt.Printf("mqtt5: disconnected: %+v\n", err)
+			rhManager.ResetRequestHandler()
+		},
+		ClientConfig: *config,
+	}
+	connMgr := newConnectionManager(autoConfig)
+	return &Client{
+		config:                config,
+		connectionManager:     connMgr,
+		requestHandlerManager: rhManager,
+		subscriptionManager:   subMgr,
 		shutdownCtx:           shutdownCtx,
 		shutdown:              shutdown,
 	}
 }
 
 func (c *Client) Connect(ctx context.Context) error {
-	c.connMgrMu.Lock()
-	defer c.connMgrMu.Unlock()
-	if c.connMgr != nil {
-		return errors.New("mqtt5: already connected")
-	}
+	ctx, cancel := context.WithCancel(c.shutdownCtx)
+	defer cancel()
 
-	config := autopaho.ClientConfig{
-		BrokerUrls:        []*url.URL{c.brokerURL},
-		KeepAlive:         30,
-		ConnectRetryDelay: time.Second,
-		ConnectTimeout:    time.Second,
-		OnConnectionUp: func(connMgr *autopaho.ConnectionManager, _ *paho.Connack) {
-			fmt.Println("mqtt5: connected")
-			var delay time.Duration
-			for {
-				select {
-				case <-c.shutdownCtx.Done():
-					return
-				case <-time.After(delay):
-					rh, err := rpc.NewHandler(c.shutdownCtx, rpc.HandlerOpts{
-						Conn:             connMgr,
-						Router:           c.config.Router,
-						ResponseTopicFmt: "%s/responses", // %s には ClientID がセットされる
-						ClientID:         c.config.ClientID,
-					})
-					if err != nil {
-						fmt.Printf("mqtt5: register request handler: %+v", err)
-						delay = time.Second
-						continue
-					}
-					c.requestHandlerManager.SetRequestHandler(rh)
-					fmt.Println("mqtt5: registered request handler")
-					return
-				}
-			}
-		},
-		OnConnectError: func(err error) {
-			fmt.Printf("mqtt5: disconnected: %+v\n", err)
-			c.requestHandlerManager.ResetRequestHandler()
-		},
-		ClientConfig: *c.config,
+	if _, err := c.connectionManager.AwaitConnectionManager(ctx); err != nil {
+		return err
 	}
-	connMgr, err := autopaho.NewConnection(c.shutdownCtx, config)
-	if err != nil {
-		return fmt.Errorf("mqtt5: unexpected error occurred while waiting new connection: %w", err)
-	}
-	if err := connMgr.AwaitConnection(ctx); err != nil {
-		return fmt.Errorf("mqtt5: await connection: %w", err)
-	}
-	c.connMgr = connMgr
 	return nil
 }
 
 func (c *Client) Disconnect(ctx context.Context) error {
-	c.connMgrMu.Lock()
-	defer c.connMgrMu.Unlock()
+	defer c.shutdown()
 
-	if c.connMgr == nil {
-		return errors.New("mqtt5: already disconnected")
+	if err := c.connectionManager.Close(ctx); err != nil {
+		return err
 	}
-	if err := c.connMgr.Disconnect(ctx); err != nil {
-		return fmt.Errorf("mqtt5: disconnect: %w", err)
-	}
-	c.connMgr = nil
 	return nil
 }
 
@@ -110,6 +89,7 @@ func (c *Client) Request(ctx context.Context, topic string, payload []byte) ([]b
 	if err != nil {
 		return nil, err
 	}
+	fmt.Println("send request")
 	resp, err := rh.Request(ctx, &paho.Publish{
 		Topic:   topic,
 		Payload: payload,
@@ -128,11 +108,14 @@ func (c *Client) RegisterRequestHandler(topic string, handler func(req []byte) (
 		}
 		resp := handler(m.Payload)
 
-		var connMgr *autopaho.ConnectionManager
-		c.connMgrMu.Lock()
-		connMgr = c.connMgr
-		c.connMgrMu.Unlock()
+		// context TODO
+		connMgr, err := c.connectionManager.AwaitConnectionManager(context.TODO())
+		if err != nil {
+			// TODO err handle?
+			fmt.Printf("await conn mgr: %+v\n", err)
+		}
 
+		// context TODO
 		if _, err := connMgr.Publish(context.TODO(), &paho.Publish{
 			Properties: &paho.PublishProperties{
 				CorrelationData: m.Properties.CorrelationData,
@@ -146,19 +129,36 @@ func (c *Client) RegisterRequestHandler(topic string, handler func(req []byte) (
 	})
 }
 
-// TODO refine
-func (c *Client) Subscribe(ctx context.Context, topic string) error {
-	var connMgr *autopaho.ConnectionManager
-	c.connMgrMu.Lock()
-	connMgr = c.connMgr
-	c.connMgrMu.Unlock()
-
-	if _, err := connMgr.Subscribe(ctx, &paho.Subscribe{
-		Subscriptions: []paho.SubscribeOptions{
-			{Topic: topic},
-		},
-	}); err != nil {
-		return fmt.Errorf("mqtt5: send subscribe: %w", err)
+func (c *Client) Subscribe(ctx context.Context, subscribe *paho.Subscribe) error {
+	connMgr, err := c.connectionManager.AwaitConnectionManager(ctx)
+	if err != nil {
+		return err
+	}
+	if err := c.subscriptionManager.Subscribe(ctx, connMgr, subscribe); err != nil {
+		return err
 	}
 	return nil
+}
+
+func awaitNewRequestHandler(ctx context.Context, connMgr *autopaho.ConnectionManager, config *paho.ClientConfig) (*rpc.Handler, error) {
+	var delay time.Duration
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+			rh, err := rpc.NewHandler(ctx, rpc.HandlerOpts{
+				Conn:             connMgr,
+				Router:           config.Router,
+				ResponseTopicFmt: "%s/responses", // %s には ClientID がセットされる
+				ClientID:         config.ClientID,
+			})
+			if err != nil {
+				fmt.Printf("mqtt5: register request handler: %+v", err)
+				delay = time.Second
+				continue
+			}
+			return rh, nil
+		}
+	}
 }

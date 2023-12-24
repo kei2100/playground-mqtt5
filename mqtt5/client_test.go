@@ -3,6 +3,8 @@ package mqtt5
 import (
 	"context"
 	"fmt"
+	"github.com/eclipse/paho.golang/paho"
+	"log"
 	"net/url"
 	"os"
 	"os/signal"
@@ -25,6 +27,7 @@ func TestClient_Connect(t *testing.T) {
 	if err := cli.Connect(ctx); err != nil {
 		t.Fatal(err)
 	}
+	fmt.Println("connected")
 	if err := cli.Disconnect(ctx); err != nil {
 		t.Error(err)
 	}
@@ -51,17 +54,21 @@ func TestClient_Request(t *testing.T) {
 	cli2.RegisterRequestHandler("foo", func(req []byte) (resp []byte) {
 		return req
 	})
-	if err := cli2.Subscribe(ctx, "foo"); err != nil {
+	if err := cli2.Subscribe(ctx, &paho.Subscribe{Subscriptions: []paho.SubscribeOptions{{Topic: "foo"}}}); err != nil {
 		t.Fatal(err)
 	}
 
 	for {
-		resp, err := cli1.Request(ctx, "foo", []byte("hello"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		fmt.Println(string(resp))
-		time.Sleep(time.Second)
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			resp, err := cli1.Request(ctx, "foo", []byte("hello"))
+			if err != nil {
+				log.Println(err.Error())
+			}
+			fmt.Println(string(resp))
+			time.Sleep(time.Second)
+		}()
 	}
 }
 
